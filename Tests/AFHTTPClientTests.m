@@ -22,6 +22,88 @@
 
 #import "AFNetworkingTests.h"
 
+@interface AFBufferedInputStreamProvider : NSObject <NSStreamDelegate>
+@property (nonatomic, strong) NSData *data;
+@property (nonatomic, strong) NSInputStream *inputStream;
+@property (nonatomic, strong) NSOutputStream *outputStream;
+@property (nonatomic, readonly) NSUInteger bytesWritten;
+
+- (id)initWithData:(NSData *)data;
+@end
+
+@implementation AFBufferedInputStreamProvider
+
+- (id)initWithData:(NSData *)data {
+    self = [super init];
+    if (!self) {
+        return nil;
+    }
+
+    self.data = data;
+
+    CFReadStreamRef readStream;
+    CFWriteStreamRef writeStream;
+    CFStreamCreateBoundPair(NULL, &readStream, &writeStream, 16);
+    
+    self.inputStream = CFBridgingRelease(readStream);
+    
+    self.outputStream = CFBridgingRelease(writeStream);
+    self.outputStream.delegate = self;
+    [self.outputStream scheduleInRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+    
+    [self.outputStream open];
+
+    return self;
+}
+
+- (void)dealloc {
+    [self cleanup];
+}
+
+- (void)cleanup {
+    [self.outputStream close];
+    self.outputStream.delegate = nil;
+    [self.outputStream removeFromRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+    _outputStream = nil;
+
+    [self.inputStream close];
+    _inputStream = nil;
+}
+
+- (void)writeBytesIfPossible {
+    while ([self.outputStream hasSpaceAvailable] && self.bytesWritten < [self.data length]) {
+        const uint8_t *bytes = [self.data bytes];
+        NSInteger bytesWritten = [self.outputStream write:bytes maxLength:[self.data length] - self.bytesWritten];
+
+        if (bytesWritten < 0) {
+            [self cleanup];
+            return;
+        }
+
+        _bytesWritten += bytesWritten;
+    }
+
+    if (self.bytesWritten >= [self.data length]) {
+        [self cleanup];
+    }
+}
+
+#pragma mark - NSStreamDelegate
+
+- (void)stream:(NSStream *)stream
+   handleEvent:(NSStreamEvent)eventCode
+{
+    if (stream == self.outputStream && (eventCode & NSStreamEventHasSpaceAvailable)) {
+        [self writeBytesIfPossible];
+    } else if (eventCode & NSStreamEventErrorOccurred || eventCode & NSStreamEventEndEncountered) {
+        [self cleanup];
+    }
+}
+
+@end
+
+#pragma mark -
+
 @interface AFHTTPClientTests : SenTestCase
 @property (readwrite, nonatomic, strong) AFHTTPClient *client;
 @end
@@ -347,6 +429,27 @@
     [self.client enqueueHTTPRequestOperation:operation];
     expect(operation.isFinished).will.beTruthy();
     expect(operation.error).notTo.equal(NSURLErrorTimedOut);
+}
+
+- (void)testMultipartUploadDoesNotPrematurelyCloseInputStream {
+    NSData *data = [@"ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890" dataUsingEncoding:NSUTF8StringEncoding];
+    __block AFBufferedInputStreamProvider *streamProvider = [[AFBufferedInputStreamProvider alloc] initWithData:data];
+    __block NSUInteger bytesWritten = 0;
+    NSInputStream *inputStream = streamProvider.inputStream;
+
+    NSMutableURLRequest *request = [self.client multipartFormRequestWithMethod:@"POST" path:@"/post" parameters:@{ @"foo": @"bar" } constructingBodyWithBlock:^(id<AFMultipartFormData> formData) {
+        [formData appendPartWithInputStream:inputStream name:@"data" fileName:@"string.txt" length:[data length] mimeType:@"text/plain"];
+    }];
+    
+    AFHTTPRequestOperation *operation = [[AFHTTPRequestOperation alloc] initWithRequest:request];
+    operation.completionBlock = ^{
+        bytesWritten = streamProvider.bytesWritten;
+        streamProvider = nil;
+    };
+    
+    [self.client enqueueHTTPRequestOperation:operation];
+    expect(operation.isFinished).will.beTruthy();
+    expect(bytesWritten).will.equal([data length]);
 }
 
 @end
